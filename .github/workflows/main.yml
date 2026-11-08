@@ -1,0 +1,206 @@
+name: Local Secure CI/CD
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Restore pip cache
+        uses: actions/cache@v4
+        with:
+          path: .cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+
+      - name: Check secret from local runner
+        env:
+          CI_SECRET: ${{ secrets.CI_SECRET }}
+        run: |
+          test -n "$CI_SECRET"
+          echo "CI secret received through environment variable."
+
+      - name: Build application in Docker
+        run: |
+          mkdir -p artifacts .cache/pip
+
+          docker run --rm \
+            -v "${{ github.workspace }}:/workspace" \
+            -v "${{ github.workspace }}/.cache/pip:/root/.cache/pip" \
+            -w /workspace \
+            python:3.10-slim \
+            sh -c '
+              python -m pip install \
+                --disable-pip-version-check \
+                -r requirements.txt &&
+              python -m py_compile app/*.py main.py &&
+              tar -czf artifacts/secure-file-manager.tar.gz \
+                app \
+                main.py \
+                requirements-runtime.txt
+            '
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: secure-file-manager-build
+          path: artifacts/secure-file-manager.tar.gz
+          if-no-files-found: error
+
+
+  test:
+    name: Test
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: secure-file-manager-build
+          path: artifacts/from-build
+
+      - name: Verify build artifact
+        run: |
+          test -f \
+            artifacts/from-build/secure-file-manager.tar.gz
+
+          echo "Build artifact received successfully."
+
+          tar -tzf \
+            artifacts/from-build/secure-file-manager.tar.gz
+
+      - name: Restore pip cache
+        uses: actions/cache@v4
+        with:
+          path: .cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+
+      - name: Run pytest in Docker
+        run: |
+          mkdir -p reports .cache/pip
+
+          docker run --rm \
+            -v "${{ github.workspace }}:/workspace" \
+            -v "${{ github.workspace }}/.cache/pip:/root/.cache/pip" \
+            -w /workspace \
+            python:3.10-slim \
+            sh -c '
+              python -m pip install \
+                --disable-pip-version-check \
+                -r requirements.txt &&
+              pytest -v \
+                --junitxml=reports/junit.xml
+            '
+
+      - name: Upload JUnit report
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-junit-report
+          path: reports/junit.xml
+          if-no-files-found: error
+
+
+  sast:
+    name: SAST
+    needs: test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Run Semgrep in Docker
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/src" \
+            -w /src \
+            semgrep/semgrep \
+            semgrep scan \
+            --config auto \
+            --error \
+            app main.py
+
+
+  deploy:
+    name: Local Deploy
+    needs: sast
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            -t secure-file-manager:ci \
+            .
+
+      - name: Verify non-root runtime
+        run: |
+          docker run --rm \
+            --entrypoint id \
+            secure-file-manager:ci
+
+      - name: Run local deployment with port mapping
+        run: |
+          docker rm -f \
+            secure-file-manager-deploy \
+            2>/dev/null || true
+
+          docker run -d \
+            --name secure-file-manager-deploy \
+            -p 8080:8080 \
+            secure-file-manager:ci \
+            python -m app.health_server
+
+          cleanup() {
+            docker rm -f \
+              secure-file-manager-deploy \
+              >/dev/null 2>&1 || true
+          }
+
+          trap cleanup EXIT
+
+          for attempt in 1 2 3 4 5
+          do
+            if curl -fsS \
+              http://127.0.0.1:8080/health
+            then
+              echo
+              echo "Local deployment is healthy."
+              exit 0
+            fi
+
+            sleep 1
+          done
+
+          echo "Health check failed."
+          docker logs secure-file-manager-deploy
+          exit 1
+
+      - name: Save Docker image as artifact
+        run: |
+          mkdir -p artifacts
+
+          docker save \
+            secure-file-manager:ci \
+            | gzip \
+            > artifacts/secure-file-manager-image.tar.gz
+
+      - name: Upload Docker image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: secure-file-manager-docker-image
+          path: artifacts/secure-file-manager-image.tar.gz
+          if-no-files-found: error

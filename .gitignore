@@ -13,6 +13,7 @@ storage/*
 .env
 .secrets
 
+.cache/
 reports/
 artifacts/
 .act-artifacts/
